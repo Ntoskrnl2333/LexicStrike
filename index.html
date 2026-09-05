@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>在线测验</title>
+  <style>
+    /* 样式与之前完全相同，省略重复，保留核心样式 */
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 30px auto; padding: 0 16px; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .choice {
+      display: block; margin: 6px 0; padding: 10px 14px;
+      border: 1px solid #ccc; border-radius: 6px; cursor: pointer;
+      background: #f9f9f9; transition: 0.2s;
+    }
+    .choice:hover:not(.disabled) { background: #e6f0ff; }
+    .choice.correct { background: #a8e6a8; border-color: #2e7d32; }
+    .choice.wrong { background: #f8a8a8; border-color: #c62828; }
+    .choice.disabled { pointer-events: none; opacity: 0.7; }
+    button {
+      padding: 10px 24px; border: none; border-radius: 6px;
+      background: #1a73e8; color: white; font-size: 16px;
+      cursor: pointer; margin: 4px 6px 4px 0;
+    }
+    button:hover { background: #1557b0; }
+    .list-item { margin: 8px 0; }
+    #feedback { font-size: 18px; font-weight: bold; margin: 12px 0; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- 首页 -->
+  <div id="page-home" class="page active">
+    <h1>📚 在线测验</h1>
+    <button id="btn-fetch-list">获取试卷列表</button>
+    <div id="list-container"></div>
+  </div>
+
+  <!-- 测验页 -->
+  <div id="page-test" class="page">
+    <h2 id="test-title">测验中</h2>
+    <p id="progress">第 1 / 0 题</p>
+    <p id="question-title" style="font-size:20px; font-weight:500;">题目</p>
+    <div id="choices-container"></div>
+    <div id="feedback"></div>
+  </div>
+
+  <!-- 结果页 -->
+  <div id="page-result" class="page">
+    <h2>🎉 Congratulations</h2>
+    <p id="result-correct">Correct: 0 / 0</p>
+    <p id="result-rate">Correct Rate: 0%</p>
+    <p id="result-wrong">Wrong: 0 题</p>
+    <p id="result-score">Score: 0 分</p>
+    <button id="back-btn">Back</button>
+    <button id="tryagain-btn">Try again</button>
+  </div>
+</div>
+
+<script>
+  // ============================================================
+  // 1. XML 解析工具（保持不变）
+  // ============================================================
+  const parseTestList = (xmlStr) => {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlStr, 'text/xml');
+    const nodes = doc.getElementsByTagName('ts');
+    const result = [];
+    for (const node of nodes) {
+      const name = node.getAttribute('name');
+      const friendly = node.textContent.trim();
+      if (name) result.push({ name, friendly });
+    }
+    return result;
+  };
+
+  const parseProbs = (xmlStr) => {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlStr, 'text/xml');
+    const nodes = doc.getElementsByTagName('prob');
+    const result = [];
+    for (const node of nodes) {
+      const id = node.getAttribute('id') || '';
+      const title = node.querySelector('title')?.textContent?.trim() || '（无题目）';
+      const choNodes = node.querySelectorAll('chos cho');
+      const chos = [];
+      for (const cho of choNodes) {
+        const choId = cho.getAttribute('id') || '';
+        const text = cho.textContent.trim();
+        chos.push({ id: choId, text });
+      }
+      const answer = node.querySelector('answer')?.textContent?.trim() || '';
+      result.push({ id, title, chos, answer });
+    }
+    return result;
+  };
+
+  // ============================================================
+  // 2. 页面切换
+  // ============================================================
+  const showPage = (pageId) => {
+    document.querySelectorAll('.page').forEach((el) => el.classList.remove('active'));
+    document.getElementById(pageId).classList.add('active');
+  };
+
+  // ============================================================
+  // 3. 全局状态
+  // ============================================================
+  let tests = [];
+  let currentTestName = '';
+  let currentProbs = [];
+  let currentIndex = 0;
+  let correctCount = 0;
+  let wrongCount = 0;
+  let totalCount = 0;
+  let isAnswered = false;
+  let timerId = null;
+
+  // ============================================================
+  // 4. 首页：获取试卷列表（真实 fetch）
+  // ============================================================
+  document.getElementById('btn-fetch-list').addEventListener('click', async () => {
+    const container = document.getElementById('list-container');
+    container.innerHTML = '加载中...';
+
+    try {
+      // ---------- 替换为你的真实 API 地址 ----------
+      const response = await fetch('/api/list');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const xml = await response.text();
+
+      tests = parseTestList(xml);
+      if (tests.length === 0) {
+        container.innerHTML = '暂无试卷';
+        return;
+      }
+
+      container.innerHTML = '';
+      tests.forEach((t) => {
+        const btn = document.createElement('button');
+        btn.className = 'list-item';
+        btn.textContent = `📖 ${t.friendly}`;
+        btn.addEventListener('click', () => startTest(t.name));
+        container.appendChild(btn);
+      });
+    } catch (err) {
+      container.innerHTML = '❌ 加载失败，请重试';
+      console.error(err);
+    }
+  });
+
+  // ============================================================
+  // 5. 开始测验（真实 fetch）
+  // ============================================================
+  const startTest = async (testName) => {
+    // 重置状态
+    currentTestName = testName;
+    currentIndex = 0;
+    correctCount = 0;
+    wrongCount = 0;
+    isAnswered = false;
+    if (timerId) clearTimeout(timerId);
+
+    showPage('page-test');
+    document.getElementById('test-title').textContent = `📝 ${testName}`;
+
+    try {
+      // ---------- 替换为你的真实 API 地址 ----------
+      const response = await fetch(`/api/probs?name=${encodeURIComponent(testName)}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const xml = await response.text();
+
+      currentProbs = parseProbs(xml);
+      totalCount = currentProbs.length;
+
+      if (totalCount === 0) {
+        document.getElementById('question-title').textContent = '该试卷暂无题目';
+        document.getElementById('choices-container').innerHTML = '';
+        document.getElementById('progress').textContent = '0 / 0';
+        return;
+      }
+
+      renderQuestion();
+    } catch (err) {
+      alert('加载题目失败，请重试');
+      console.error(err);
+    }
+  };
+
+  // ============================================================
+  // 6. 渲染当前题目
+  // ============================================================
+  const renderQuestion = () => {
+    if (currentIndex >= totalCount) {
+      showResult();
+      return;
+    }
+
+    const prob = currentProbs[currentIndex];
+    document.getElementById('progress').textContent = `第 ${currentIndex + 1} / ${totalCount} 题`;
+    document.getElementById('question-title').textContent = prob.title;
+    document.getElementById('feedback').textContent = '';
+
+    const container = document.getElementById('choices-container');
+    container.innerHTML = '';
+
+    prob.chos.forEach((cho) => {
+      const div = document.createElement('div');
+      div.className = 'choice';
+      div.textContent = `${cho.id}. ${cho.text}`;
+      div.dataset.choiceId = cho.id;
+      div.addEventListener('click', () => onChoiceClick(div, cho.id));
+      container.appendChild(div);
+    });
+
+    isAnswered = false;
+  };
+
+  // ============================================================
+  // 7. 点击选项
+  // ============================================================
+  const onChoiceClick = (el, choiceId) => {
+    if (isAnswered) return;
+    isAnswered = true;
+
+    const prob = currentProbs[currentIndex];
+    const correct = prob.answer === choiceId;
+
+    const allChoices = document.querySelectorAll('.choice');
+    allChoices.forEach((c) => c.classList.add('disabled'));
+
+    allChoices.forEach((c) => {
+      if (c.dataset.choiceId === prob.answer) {
+        c.classList.add('correct');
+      }
+    });
+
+    if (!correct) {
+      el.classList.add('wrong');
+      wrongCount++;
+      document.getElementById('feedback').textContent = '❌ 错误';
+    } else {
+      correctCount++;
+      document.getElementById('feedback').textContent = '✅ 正确';
+    }
+
+    if (timerId) clearTimeout(timerId);
+    timerId = setTimeout(() => {
+      currentIndex++;
+      renderQuestion();
+    }, 400);
+  };
+
+  // ============================================================
+  // 8. 显示结果页
+  // ============================================================
+  const showResult = () => {
+    showPage('page-result');
+    document.getElementById('result-correct').textContent = `Correct: ${correctCount} / ${totalCount}`;
+    const rate = totalCount ? (correctCount / totalCount) * 100 : 0;
+    document.getElementById('result-rate').textContent = `Correct Rate: ${rate.toFixed(1)}%`;
+    document.getElementById('result-wrong').textContent = `Wrong: ${wrongCount} 题`;
+    const score = correctCount;  // 每题1分，可自行调整
+    document.getElementById('result-score').textContent = `Score: ${score} 分`;
+  };
+
+  // ============================================================
+  // 9. 结果页按钮
+  // ============================================================
+  document.getElementById('back-btn').addEventListener('click', () => {
+    if (timerId) clearTimeout(timerId);
+    showPage('page-home');
+  });
+
+  document.getElementById('tryagain-btn').addEventListener('click', () => {
+    if (currentTestName) {
+      startTest(currentTestName);
+    } else {
+      showPage('page-home');
+    }
+  });
+</script>
+</body>
+</html>
